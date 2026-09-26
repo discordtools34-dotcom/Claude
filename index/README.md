@@ -2,9 +2,11 @@
 
 `check_index.py` odpowiada na trzy pytania, które zadajesz przy kupnie domeny albo przed publikacją strony:
 
-1. **Czy domena jest w indeksie Google** i w których krajach (zapytanie `site:domena` w google.pl, google.de…).
-2. **Czy jest na 1. miejscu**, czyli czy strona główna jest 1. wynikiem `site:` i które miejsce zajmuje domena
-   po wpisaniu jej nazwy (np. „test.pl”).
+1. **Czy domena jest zaindeksowana** i w których krajach. W każdym kraju (w jego języku) do Google idzie
+   **sama nazwa bez końcówki**, np. „savowin”. Skrypt wie, że chodzi o savowin.com, i szuka jej na 1. stronie
+   wyników. Jeśli tam jest, jest zaindeksowana.
+2. **Na którym miejscu jest**, czyli która z kolei jest domena na tej 1. stronie. Wynik trafia do statystyk
+   i historii. Tryb pełny (`--pelny`) sprawdza jeszcze `site:domena` i czy strona główna jest 1. wynikiem `site:`.
 3. **Czy strona jest gotowa dla ludzi**: czy działa, ma HTTPS, nie blokuje Google i nie jest parkingiem.
    Do tego wiek domeny i jej historia.
 
@@ -21,21 +23,24 @@ Działa w terminalu (`check_index.py`) i jako **bot Telegram na przyciskach** (`
 3. Uruchom `python3 check_index.py test.pl`.
 
 Możesz wpisać samą nazwę: `savowin` oznacza `savowin.com`. Inną końcówkę ustawisz przez `--koncowka pl`.
+Do Google i tak idzie samo „savowin”, bez końcówki.
 
 Bez klucza też coś sprawdzisz: `--bez-api` uruchamia same darmowe testy (strona, rejestracja, archiwum).
 
 ## Najczęstsze użycia
 
 ```bash
-python3 check_index.py test.pl                          # pełny raport: 30 krajów + strona + rejestracja + archiwum
-python3 check_index.py test.pl --kraje pl               # tylko Polska (1–6 zapytań)
-python3 check_index.py savowin --kraje pl               # sama nazwa = savowin.com; pozycja dla „savowin”
-python3 check_index.py savowin --szybko                 # tryb szybki: tylko „savowin” na 1. stronie, 1 zapytanie na kraj
+python3 check_index.py savowin                          # = savowin.com: „savowin” w 30 krajach, 1. strona:
+                                                        #   zaindeksowana i na którym miejscu (30 zapytań)
+python3 check_index.py savowin --kraje pl               # tylko Polska (1 zapytanie)
+python3 check_index.py savowin --sprawdz-indeks         # tam, gdzie brak na 1. stronie, dopytaj site:
+python3 check_index.py savowin --pelny                  # tryb pełny: site:savowin.com + pozycja na nazwę
 python3 check_index.py -f domeny.txt --bez-api          # darmowa wstępna selekcja wielu domen (0 zapytań)
 python3 check_index.py -f domeny.txt --kraje pl --csv wyniki.csv   # porównanie domen, wyniki do Excela
-python3 check_index.py test.pl --pozycja                # pozycja na własną nazwę we wszystkich krajach
+python3 check_index.py test.pl --pozycja                # tryb pełny: pozycja na nazwę wszędzie (do 3. str.)
 python3 check_index.py test.pl --fraza "tanie buty" --kraje pl     # pozycja dla własnej frazy
-python3 check_index.py nowa-domena.pl --potwierdz       # powtórz każde „NIE” (nowe domeny są chwiejne)
+python3 check_index.py nowa-domena.pl --potwierdz       # tryb pełny: powtórz każde „NIE” (nowe domeny)
+python3 check_index.py --statystyki                     # wszystkie domeny: zaindeksowana, miejsca, werdykt
 python3 check_index.py --historia test.pl               # jak zmieniał się indeks przy kolejnych sprawdzeniach
 python3 check_index.py --konto                          # ile zostało zapytań na każdym kluczu (za darmo)
 python3 check_index.py --help                           # wszystkie opcje
@@ -65,10 +70,14 @@ Przyciski:
   - pozycja na nazwę (rynek / wszędzie / wyłączona) i „do strony” (1/3/5/10);
   - powtórki NIE i końcówka dla samej nazwy;
   - fraza, darmowe testy (strona, rejestr, archiwum) oraz Google API (wł./wył. i wybór dostawcy).
-- **Wynik**: Kraje (tabela), Strona, Domena, Archiwum, Wszystkie uwagi, CSV (dwa pliki), Sprawdź ponownie,
-  Potwierdź NIE i link do ręcznego sprawdzenia w Google.
-- **Statystyki**: sprawdzenia i zużyte zapytania (dziś, 7 dni, łącznie), werdykty, ostatnie domeny.
-- **Historia**: poprzednie sprawdzenia domeny, wspólne z terminalem. **Konto API**: stan każdego klucza. **Pomoc**.
+- **Wynik**: „Zaindeksowana: 28/30” i miejsca (np. „1. miejsce w 25 · 2. w 3 · śr. 1.1”), Kraje (tabela:
+  zaindeksowana i miejsce w każdym kraju), Strona, Domena, Archiwum, Wszystkie uwagi, CSV (dwa pliki),
+  Sprawdź ponownie, Potwierdź NIE i link do ręcznego sprawdzenia w Google.
+- **Statystyki**: sprawdzenia i zużyte zapytania (dziś, 7 dni, łącznie), werdykty, ile domen jest zaindeksowanych
+  i ile ma 1. miejsce na głównym rynku, a przy każdej ostatnio sprawdzanej domenie: w ilu krajach zaindeksowana,
+  ile razy 1. miejsce, średnie miejsce i miejsce na głównym rynku.
+- **Historia**: poprzednie sprawdzenia domeny (wspólne z terminalem) i miejsce w każdym kraju z ostatniego.
+  **Konto API**: stan każdego klucza. **Pomoc**.
 
 Przy sprawdzeniu za ponad 100 zapytań bot pyta o zgodę. Kolejne domeny czekają w kolejce. Klucze z `.env` bot czyta
 przy każdym sprawdzeniu, więc dopisany klucz działa bez restartu. Ustawienia i statystyki zapisuje w `bot_stan.json`.
@@ -97,19 +106,32 @@ Jak to działa:
 
 ## Tryb szybki i tryb pełny
 
-| | Tryb szybki (`--szybko`, w bocie domyślny) | Tryb pełny (domyślny w terminalu) |
+| | Tryb szybki (domyślny w terminalu i w bocie) | Tryb pełny (`--pelny`) |
 |---|---|---|
 | Co wysyła do Google | samą nazwę („savowin”), tylko 1. strona wyników | `site:savowin.com` + samą nazwę do wybranej strony |
-| Co mówi | czy savowin.com jest na 1. stronie i na którym miejscu, w każdym kraju | czy jest w indeksie, czy strona główna jest 1. w `site:`, pozycja na nazwę |
+| Co mówi | czy savowin.com jest na 1. stronie (= zaindeksowana) i na którym miejscu, w każdym kraju | czy jest w indeksie, czy strona główna jest 1. w `site:`, pozycja na nazwę |
 | Koszt | **1 zapytanie na kraj** | 1 na kraj + 1–3 na pozycję |
-| Gdy domeny nie ma na 1. stronie | nie wiadomo, czy jest w indeksie; `--sprawdz-indeks` dopyta wtedy `site:` (1 zapytanie więcej, tylko tam) | wiadomo z `site:` |
+| Gdy domeny nie ma na 1. stronie | nie wiadomo, czy jest w indeksie dalej; `--sprawdz-indeks` dopyta wtedy `site:` (1 zapytanie więcej, tylko tam) | wiadomo z `site:` |
 
 Przy kupnie domeny tryb szybki od razu odpowiada, czy domena jest na 1. miejscu na swoją nazwę.
-Pełny przydaje się, gdy trzeba wiedzieć, dlaczego nie jest.
+Pełny przydaje się, gdy trzeba wiedzieć, dlaczego nie jest. `--pozycja`, `--bez-pozycji` i `--potwierdz`
+działają tylko w trybie pełnym, więc same go włączają.
 
 ## Jak czytać raport
 
-### Indeks Google
+### Zaindeksowana i miejsce (tryb szybki)
+
+| Kolumna | Znaczenie |
+|---|---|
+| **Zaindeksowana** | TAK: po wpisaniu samej nazwy („savowin”) savowin.com jest na 1. stronie wyników. NIE: nie ma jej na 1. stronie. Z `--sprawdz-indeks` w krajach bez 1. strony widać wynik `site:`: „TAK (site:)” (jest w indeksie, ale dalej) albo „NIE (site:)”. BŁĄD: nie udało się sprawdzić. |
+| **Miejsce** | Która z kolei jest domena na 1. stronie (liczą się wyniki organiczne, bez reklam). |
+
+Pod tabelą są **STATYSTYKI**: w ilu krajach domena jest zaindeksowana (np. „28/30 krajów (93%)”),
+w których krajach jest na 1., 2., 3.… miejscu, gdzie jej brak, średnie miejsce i miejsce na głównym rynku.
+To samo jest w bocie (📊 Statystyki), w historii i w CSV (`na_1_stronie`, `na_1_stronie_krajow`,
+`pierwsze_miejsce_krajow`, `srednie_miejsce`). `--statystyki` pokazuje tabelę wszystkich sprawdzanych domen.
+
+### Tryb pełny: indeks Google (`site:`)
 
 | Kolumna | Znaczenie |
 |---|---|
@@ -128,7 +150,8 @@ Gdy na głównym rynku wyjdzie NIE, raport pokazuje link „Sprawdź ręcznie”
 
 W pierwszych tygodniach różne serwery Google mają różny stan indeksu nowej domeny. To samo zapytanie potrafi
 raz ją pokazać, a raz nie, a różnice między krajami są wtedy przypadkowe (to nie filtr krajowy).
-Dlatego skrypt sam powtarza wynik NIE na głównym rynku, jeśli domena jest widoczna w innym kraju albo ma mniej niż 90 dni:
+Dlatego w trybie pełnym skrypt sam powtarza wynik NIE na głównym rynku, jeśli domena jest widoczna w innym kraju
+albo ma mniej niż 90 dni:
 1. pyta przez google.com z tym samym krajem;
 2. potem wysyła świeże zapytanie, pomijając pamięć podręczną SerpApi.
 
@@ -179,13 +202,18 @@ raport pokazuje, co się zmieniło, np. `google.de: indeks NIE → TAK` albo `po
 Nowo kupioną domenę sprawdzaj co kilka dni, a zobaczysz, kiedy wejdzie do indeksu.
 `--bez-zapisu` wyłącza zapis.
 
+`--statystyki` zbiera z historii ostatnie sprawdzenie każdej domeny w jedną tabelę: w ilu krajach zaindeksowana,
+w ilu 1. miejsce, średnie miejsce, miejsce na głównym rynku i werdykt. Na końcu jest podsumowanie, np.
+„Zaindeksowane (choć w jednym kraju): 4/5”. `--statystyki savowin vakowin` pokaże tylko te domeny.
+
 ## Koszt (zapytania API)
 
-- Tryb szybki: dokładnie 1 zapytanie na kraj (z `--sprawdz-indeks` plus 1 tam, gdzie brak na 1. stronie).
+- Tryb szybki (domyślny): dokładnie 1 zapytanie na kraj (z `--sprawdz-indeks` plus 1 tam, gdzie brak na 1. stronie).
 - Tryb pełny: 1 zapytanie na kraj plus 1–3 zapytania o pozycję na własną nazwę na głównym rynku.
-- Powtórka „NIE” na głównym rynku kosztuje do 2 zapytań i dotyczy tylko domen nowych albo widocznych gdzie indziej.
-  Stara domena bez indeksu nie kosztuje nic dodatkowo.
-- Domyślnie jest 30 krajów, czyli 30–35 zapytań na domenę. Z `--kraje pl` to 1–6 zapytań.
+- Powtórka „NIE” (tryb pełny) na głównym rynku kosztuje do 2 zapytań i dotyczy tylko domen nowych albo
+  widocznych gdzie indziej. Stara domena bez indeksu nie kosztuje nic dodatkowo.
+- Domyślnie jest 30 krajów, czyli 30 zapytań na domenę (w trybie pełnym 30–35). Z `--kraje pl` to 1 zapytanie
+  (w trybie pełnym 1–6).
 - `--pozycja` i `--fraza` dodają do 3 zapytań na każdy kraj, a `--potwierdz` do 2 zapytań na każdy kraj z NIE.
 - SerpApi nie liczy tego samego zapytania powtórzonego w ciągu godziny. Serper liczy każde.
 - Powyżej 100 zapytań skrypt pyta o potwierdzenie (`--tak` pomija pytanie). W nagłówku raportu widać,

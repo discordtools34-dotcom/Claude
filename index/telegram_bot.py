@@ -263,7 +263,9 @@ class Store:
             self.save()
             return self.settings(user_id)
 
-    def record(self, reports: list, queries: int) -> None:
+    def record(self, reports: list, queries: int, plan=None) -> None:
+        """Zapisuje sprawdzenie w statystykach; z `plan` także indeks i miejsca na samą nazwę (bez planu — np. po
+        przerwanym sprawdzeniu — zostają poprzednie)."""
         with self.lock:
             stats, now = self.data["stats"], datetime.now().astimezone()
             day = stats["days"].setdefault(now.strftime("%Y-%m-%d"), {"checks": 0, "queries": 0})
@@ -274,6 +276,9 @@ class Store:
                 entry = self.data["domains"].setdefault(report.domain, {"checks": 0})
                 entry.update(checks=entry.get("checks", 0) + 1, last=now.isoformat(timespec="seconds"),
                              verdict=report.verdict)
+                google = google_summary(report, plan) if plan else None
+                if google:
+                    entry["google"] = google
             stats["queries"] += queries
             day["queries"] += queries
             for old in sorted(stats["days"])[:-90]:  # statystyki dzienne z ostatnich 90 dni
@@ -286,6 +291,29 @@ class Store:
     def recent(self, count: int = 10) -> list[tuple[str, dict]]:
         with self.lock:
             return sorted(self.data["domains"].items(), key=lambda kv: kv[1].get("last", ""), reverse=True)[:count]
+
+
+def google_summary(report, plan) -> dict | None:
+    """Do statystyk: w ilu krajach zaindeksowana i na których miejscach (None = sprawdzenie bez Google)."""
+    stats = ci.NameStats.of_report(report, plan)
+    if not stats.checked:
+        return None
+    return {"mode": plan.mode, "checked": stats.checked, "indexed": stats.indexed, "first": stats.first,
+            "ranked": len(stats.places), "avg": round(stats.average, 1) if stats.average else None,
+            "market": stats.market, "place": stats.places.get(stats.market)}
+
+
+def google_text(g: dict) -> str:
+    """„zaindeksowana 28/30 · 1. miejsce w 25/30 · śr. 1.2 · 🇵🇱 1.” z podsumowania zapisanego w statystykach."""
+    parts = [f"{'zaindeksowana' if g.get('mode') == 'quick' else 'indeks'} {g.get('indexed', 0)}/{g.get('checked', 0)}"]
+    if (g.get("ranked") or 0) > 1:
+        parts.append(f"1. miejsce w {g.get('first', 0)}/{g['ranked']}")
+        if g.get("avg"):
+            parts.append(f"śr. {g['avg']}")
+    if isinstance(g.get("place"), int):
+        market = str(g.get("market") or "")
+        parts.append(f"{flag(market) or market.upper()} {ci.place_text(g['place'])}")
+    return " · ".join(parts)
 
 
 # --- Ustawienia -> plan sprawdzania ---------------------------------------------------
@@ -337,7 +365,8 @@ def parse_domains(text: str, tld: str) -> tuple[list[str], list[str]]:
 def settings_summary(s: dict) -> str:
     market = market_of(s)
     if s["mode"] == "quick":
-        mode = ("⚡ Tryb <b>szybki</b>: samo „nazwa” w Google, tylko 1. strona — 1 zapytanie na kraj"
+        mode = ("⚡ Tryb <b>szybki</b>: sama nazwa w Google (<code>savowin</code>, bez końcówki), tylko 1. strona — "
+                "jest na niej = zaindeksowana + miejsce; 1 zapytanie na kraj"
                 + (" (+ site:, gdy brak na 1. stronie)" if s["index_fallback"] else ""))
     else:
         mode = (f"⚡ Tryb <b>pełny</b>: site: w każdym kraju + pozycja na samą nazwę {BRAND_NAMES[s['brand']]} "
@@ -428,9 +457,12 @@ def help_view():
     text = ("❓ <b>Jak to działa</b>\n"
             "• Wyślij domenę (<code>savowin.com</code>) albo samą nazwę (<code>savowin</code> — dopiszę końcówkę "
             "z ustawień). Kilka domen: każda w nowej linii.\n"
-            "• ⚡ <b>Tryb szybki</b> (domyślny) — w każdym kraju jedno zapytanie o samą nazwę (np. „savowin”) i tylko "
-            "1. strona: czy domena na niej jest i na którym miejscu. Gdy jej nie ma, nie wiadomo, czy jest w indeksie "
+            "• ⚡ <b>Tryb szybki</b> (domyślny) — w każdym kraju (w jego języku) jedno zapytanie o samą nazwę bez "
+            "końcówki (np. „savowin” dla savowin.com) i tylko 1. strona. Jest na niej → <b>zaindeksowana</b> "
+            "i <b>miejsce</b> (która z kolei). Gdy jej nie ma, nie wiadomo, czy jest w indeksie dalej "
             "(włącz „site: gdy brak na 1. str.” — 1 zapytanie więcej tylko tam).\n"
+            "• 📊 <b>Statystyki</b> — dla każdej domeny: w ilu krajach zaindeksowana, ile razy 1. miejsce, średnie "
+            "miejsce i miejsce na głównym rynku (z ostatniego sprawdzenia).\n"
             "• ⚡ <b>Tryb pełny</b> — <code>site:domena</code> w każdym kraju (indeks) + pozycja na nazwę do wybranej strony. "
             "<b>TAK*</b> = znaleziona dopiero w powtórce (nowe domeny Google pokazuje niestabilnie).\n"
             "• 🥇 <b>1. w site:</b> — czy strona główna jest pierwszym wynikiem; przy małych stronach inny "
@@ -448,6 +480,7 @@ def stats_view(store: Store):
     with store.lock:
         stats = json.loads(json.dumps(store.data["stats"]))
         domains = len(store.data["domains"])
+        google = [info["google"] for info in store.data["domains"].values() if isinstance(info.get("google"), dict)]
     today = datetime.now().astimezone().strftime("%Y-%m-%d")
     week = [(datetime.now().astimezone() - timedelta(days=d)).strftime("%Y-%m-%d") for d in range(7)]
     day = stats["days"].get(today, {})
@@ -460,11 +493,19 @@ def stats_view(store: Store):
              f"Ostatnie 7 dni: {week_checks} sprawdzeń · {week_queries} zapytań API",
              f"Zapytania API od początku: {stats['queries']}",
              f"Werdykty: {verdicts}"]
+    if google:  # ostatnie sprawdzenie każdej domeny z Google
+        indexed = sum(1 for g in google if g.get("indexed"))
+        top = sum(1 for g in google if g.get("place") == 1)
+        lines.append(f"🔎 Zaindeksowane domeny: <b>{indexed}/{len(google)}</b> · 1. miejsce na nazwę na rynku: "
+                     f"<b>{top}/{len(google)}</b>")
     recent = store.recent(8)
     if recent:
-        lines += ["", "<b>Ostatnio sprawdzane</b>"]
-        lines += [f"{VERDICT_ICON.get(info.get('verdict'), '•')} {esc(domain)} — {ago(info.get('last', ''))}"
-                  for domain, info in recent]
+        lines += ["", "<b>Ostatnio sprawdzane</b> (zaindeksowana · miejsca na samą nazwę · rynek)"]
+        for domain, info in recent:
+            g = info.get("google")
+            detail = f" — {esc(google_text(g))}" if isinstance(g, dict) else ""
+            lines.append(f"{VERDICT_ICON.get(info.get('verdict'), '•')} {esc(domain)}{detail} · "
+                         f"{ago(info.get('last', ''))}")
     return "\n".join(lines), kb([("🕘 Historia", "h"), ("💳 Konto API", "k")], [("🏠 Menu", "m")])
 
 
@@ -500,17 +541,20 @@ def quick_lines(report, plan) -> list[str]:
     rows = [r for r in report.results if r.indexed is not None and r.brand]
     if not rows:
         return []
-    query = rows[0].brand.query
-    on_page = [r for r in rows if r.brand.place]
-    first = sum(1 for r in on_page if r.brand.place == 1)
-    mark = "✅" if first == len(rows) else "⚠️" if on_page else "❌"
-    lines = [f"🏷 <b>„{esc(query)}” — 1. strona:</b> {len(on_page)}/{len(rows)} {mark} · 1. miejsce: {first}"]
+    stats = ci.NameStats.of_report(report, plan)
+    query, total = rows[0].brand.query, len(stats.places)
+    mark = "✅" if stats.indexed == total else "⚠️" if stats.indexed else "❌"
+    lines = [f"🔎 <b>Zaindeksowana:</b> {stats.indexed}/{total} {mark} <i>(jest na 1. stronie po wpisaniu "
+             f"„{esc(query)}”)</i>"]
+    if stats.indexed:
+        lines.append(f"🏷 <b>Miejsce:</b> {esc(stats.places_text())}")
     market = next((r for r in rows if r.country == plan.market), None)
     if market:
         lines.append(f"    {esc(market.country.domain)}: {esc(ci.rank_text(market.brand))}")
-    missing = [r.country.domain for r in rows if not r.brand.place]
+    missing = [code.upper() for place, codes in stats.groups() if not place for code in codes]
     if missing:
-        lines.append(f"    brak na 1. stronie: {esc(', '.join(missing[:6]))}" + (f" i {len(missing) - 6} innych" if len(missing) > 6 else ""))
+        lines.append(f"    brak na 1. stronie: {esc(', '.join(missing[:10]))}"
+                     + (f" i {len(missing) - 10} innych" if len(missing) > 10 else ""))
     checked = [r for r in rows if r.index_source == "site"]
     if checked:
         yes = sum(1 for r in checked if r.indexed)
@@ -685,16 +729,20 @@ def back_row(res: RunResult, i: int) -> list:
 
 def quick_table_view(res: RunResult, i: int):
     report = res.reports[i]
-    fallback = any(r.index_source == "site" for r in report.results)
     query = next((r.brand.query for r in report.results if r.brand), ci.brand_name(report.domain))
-    rows = [(f"{'Kraj':<5}{'Miejsce':<9}" + ("site:" if fallback else "")).rstrip()]
+    rows = [f"{'Kraj':<5}{'Zaindeksowana':<15}Miejsce"]
     for r in report.results:
-        place = "BŁĄD" if r.indexed is None else short_rank(r.brand) or "—"
-        index = (ci.index_status(r) if r.index_source == "site" else "") if fallback else ""
-        rows.append(f"{r.country.code.upper():<5}{place:<9}{index}".rstrip())
+        rows.append(f"{r.country.code.upper():<5}{ci.quick_index_cell(r):<15}{ci.quick_place_cell(r)}".rstrip())
+    notes = [f"Zaindeksowana = {esc(report.domain)} jest na 1. stronie wyników po wpisaniu „{esc(query)}” "
+             f"(NIE = nie ma jej na 1. stronie). Miejsce = która z kolei."]
+    if any(r.index_source == "site" for r in report.results):
+        notes.append("(site:) = nie ma jej na 1. stronie; czy jest w indeksie — z zapytania site:")
+    stats = ci.NameStats.of_report(report, res.plan)
+    if stats.places:
+        notes.append(f"Razem: zaindeksowana {stats.indexed}/{len(stats.places)}"
+                     + (f" · {esc(stats.places_text())}" if stats.indexed else ""))
     text = (f"🌍 <b>„{esc(query)}” w krajach — {esc(report.domain)}</b>\n<pre>{esc(chr(10).join(rows))}</pre>\n"
-            f"Miejsce na 1. stronie wyników po wpisaniu „{esc(query)}” (tryb szybki)."
-            + ("\nsite: = czy jest w indeksie tam, gdzie brak na 1. stronie" if fallback else ""))
+            + "\n".join(notes))
     return text, kb(back_row(res, i))
 
 
@@ -818,19 +866,19 @@ def findings_view(res: RunResult, i: int):
 
 def list_view(res: RunResult):
     quick = res.plan.mode == "quick"
-    rows = [f"{'Domena':<24}{'1.str.' if quick else 'Indeks':<8}{'Nazwa':<9}Werdykt"]
+    rows = [f"{'Domena':<24}{'Indeks':<8}{'Nazwa':<9}Werdykt"]
     for report in res.reports:
-        checked = [r for r in report.results if r.indexed is not None]
-        if quick:
-            index = f"{sum(1 for r in checked if r.brand and r.brand.place)}/{len(checked)}" if checked else "—"
-        else:
-            index = f"{sum(1 for r in checked if r.indexed)}/{len(checked)}" if checked else "—"
+        stats = ci.NameStats.of_report(report, res.plan)
+        index = f"{stats.indexed}/{stats.checked}" if stats.checked else "—"
         market = next((r for r in report.results if r.country == res.plan.market), None)
         brand = short_rank(market.brand) if market and market.brand else "—"
         rows.append(f"{ci.clean(report.domain, 23):<24}{index:<8}{brand:<9}{report.verdict}")
     count = len(res.reports)
+    legend = ("Indeks = w ilu krajach zaindeksowana (jest na 1. stronie po wpisaniu samej nazwy), "
+              "Nazwa = miejsce na głównym rynku." if quick else
+              "Indeks = w ilu krajach jest w wynikach site:, Nazwa = miejsce po wpisaniu samej nazwy na głównym rynku.")
     lines = [f"📋 <b>Wyniki: {count} {ci.plural(count, 'domena', 'domeny', 'domen')}</b>",
-             f"<pre>{esc(chr(10).join(rows))}</pre>", "Kliknij domenę, żeby zobaczyć szczegóły."]
+             f"<pre>{esc(chr(10).join(rows))}</pre>", legend, "Kliknij domenę, żeby zobaczyć szczegóły."]
     footer = footer_lines(res)
     if footer:
         lines += [""] + footer
@@ -1083,7 +1131,8 @@ class Bot:
             self.results[result.rid] = result
             while len(self.results) > RESULTS_KEPT:
                 self.results.popitem(last=False)
-        self.store.record(reports, provider.used if provider else 0)
+        # Przerwane sprawdzenie nie nadpisuje indeksu i miejsc w statystykach (tak jak nie trafia do historii).
+        self.store.record(reports, provider.used if provider else 0, None if fatal else plan)
         log(f"Sprawdzono {domains_label(job.domains)} — zapytań API: {provider.used if provider else 0}")
         view = summary_view(result, 0) if len(reports) == 1 else list_view(result)
         self.safe_edit(job, *view)
@@ -1300,12 +1349,13 @@ def history_view(domain: str, index: int):
     if not records:
         lines.append("Brak zapisanych sprawdzeń z Google (zapisują się sprawdzenia z zapytaniami API).")
     for record in reversed(records):
-        market = record["kraje"].get(record.get("rynek")) or {}
         when = ci.clean(record.get("czas", "?"))[:16].replace("T", " ")
         verdict = ci.clean(record.get("werdykt", "?"))
-        lines.append(f"{VERDICT_ICON.get(verdict, '•')} {esc(when)} · {esc(ci.history_summary(record))} · "
-                     f"1. w site: {esc(ci.FIRST_KIND_TEXT.get(market.get('g'), '—'))} · "
-                     f"nazwa: {esc(ci.place_text(market.get('n')))}")
+        lines.append(f"{VERDICT_ICON.get(verdict, '•')} {esc(when)} · {esc(ci.history_summary(record))}")
+    places = ci.NameStats.of_record(records[-1]).places if records else {}
+    if places:
+        lines += ["", "<b>Miejsce na samą nazwę w krajach</b> (ostatnie sprawdzenie, — = brak)",
+                  esc(" · ".join(f"{code.upper()} {f'{place}.' if place else '—'}" for code, place in places.items()))]
     return "\n".join(lines), kb([("🔁 Sprawdź teraz", f"hc:{index}")], [("⬅️ Historia", "h"), ("🏠 Menu", "m")])
 
 

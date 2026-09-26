@@ -2,9 +2,11 @@
 """Sprawdza domenę: indeks Google w wielu krajach i gotowość strony do publikacji.
 
 Dla każdej domeny:
-  • indeks Google w wielu krajach — zapytanie site:domena w google.pl, google.de, …
-  • czy strona główna jest 1. wynikiem site: (klasyczny test filtra po zakupie domeny),
-  • na którym miejscu jest domena po wpisaniu jej nazwy (np. „test.pl”) i dla podanych fraz,
+  • czy jest zaindeksowana — w każdym kraju (w jego języku) do Google idzie sama nazwa bez końcówki
+    („savowin” dla savowin.com); gdy domena jest na 1. stronie wyników, jest zaindeksowana, a skrypt
+    zapisuje, na którym miejscu (statystyki i historia),
+  • tryb pełny (--pelny): zapytanie site:domena w google.pl, google.de, … i czy strona główna jest
+    1. wynikiem site: (klasyczny test filtra po zakupie domeny), pozycja na nazwę i dla podanych fraz,
   • strona WWW: DNS, przekierowania, HTTPS i certyfikat, robots.txt, noindex, parking/„na sprzedaż”,
   • rejestracja (RDAP/WHOIS): wiek domeny, wygaśnięcie, status, serwery DNS, czy jest wolna,
   • archiwum Wayback Machine: lata z kopiami i dawne tytuły (ślady spamu, parkingu),
@@ -1635,6 +1637,58 @@ class DomainReport:
     previous: str = ""
 
 
+@dataclass
+class NameStats:
+    """Statystyki jednego sprawdzenia: w ilu krajach domena jest zaindeksowana i na którym miejscu
+    po wpisaniu samej nazwy (np. „savowin” dla savowin.com)."""
+    quick: bool      # tryb szybki: zaindeksowana = jest na 1. stronie wyników dla samej nazwy
+    checked: int     # kraje sprawdzone bez błędu
+    indexed: int     # tryb szybki: na 1. stronie; tryb pełny: w wynikach site:
+    places: dict     # kod kraju -> miejsce po wpisaniu samej nazwy (0 = nie ma jej w przejrzanych wynikach)
+    market: str = ""  # kod głównego rynku
+
+    @classmethod
+    def of_report(cls, report: DomainReport, plan: Plan) -> NameStats:
+        checked = [r for r in report.results if r.indexed is not None]
+        places = {r.country.code: r.brand.place or 0 for r in checked if r.brand and not r.brand.error}
+        quick = plan.mode == "quick"
+        indexed = sum(1 for p in places.values() if p) if quick else sum(1 for r in checked if r.indexed)
+        return cls(quick, len(checked), indexed, places, plan.market.code)
+
+    @classmethod
+    def of_record(cls, record: dict) -> NameStats:
+        """Z wpisu historii — tam „n” to miejsce na samą nazwę (0 = brak, null = nie sprawdzano)."""
+        countries = {code: v for code, v in record["kraje"].items() if isinstance(v, dict)}
+        places = {code: v["n"] for code, v in countries.items() if isinstance(v.get("n"), int)}
+        quick = record.get("tryb") == "quick"
+        indexed = sum(1 for p in places.values() if p) if quick else sum(1 for v in countries.values() if v.get("i"))
+        return cls(quick, len(countries), indexed, places, str(record.get("rynek") or ""))
+
+    @property
+    def first(self) -> int:
+        return sum(1 for p in self.places.values() if p == 1)
+
+    @property
+    def average(self) -> float | None:
+        found = [p for p in self.places.values() if p]
+        return sum(found) / len(found) if found else None
+
+    def groups(self) -> list[tuple[int, list[str]]]:
+        """[(1, ['pl', 'uk']), (2, ['de']), (0, ['at'])] — miejsca rosnąco, na końcu kraje bez domeny (0)."""
+        groups: dict[int, list[str]] = {}
+        for code, place in self.places.items():
+            groups.setdefault(place, []).append(code)
+        return sorted(groups.items(), key=lambda item: (item[0] == 0, item[0]))
+
+    def places_text(self) -> str:
+        """„1. miejsce w 25 · 2. w 2 · 4. w 1 · śr. 1.2” (pusty, gdy domeny nigdzie nie ma)."""
+        found = [(place, codes) for place, codes in self.groups() if place]
+        if not found:
+            return ""
+        parts = [f"{place}. {'miejsce ' if n == 0 else ''}w {len(codes)}" for n, (place, codes) in enumerate(found)]
+        return " · ".join(parts) + f" · śr. {self.average:.1f}"
+
+
 def index_status(r: Result) -> str:
     """TAK / NIE / ? (tryb szybki: brak na 1. stronie, indeksu nie sprawdzano) / BŁĄD."""
     if r.indexed is None:
@@ -1652,6 +1706,28 @@ def rank_text(rank: Rank | None) -> str:
     if rank.place:
         return f"{rank.place}. miejsce" + (f" (str. {rank.page})" if rank.page and rank.page > 1 else "")
     return f"brak ({pages_text(rank.pages)})" + (", jest w wiadomościach" if rank.stories else "")
+
+
+def quick_index_cell(r: Result) -> str:
+    """Kolumna „Zaindeksowana” w trybie szybkim: TAK = domena jest na 1. stronie wyników dla samej nazwy."""
+    if r.indexed is None:
+        return "BŁĄD"
+    if r.brand and r.brand.place:
+        return "TAK"
+    # Nie ma jej na 1. stronie; przy dodatkowym site: wiadomo, czy w ogóle jest w indeksie.
+    return f"{yes_no(r.indexed)} (site:)" if r.index_source == "site" else "NIE"
+
+
+def quick_place_cell(r: Result) -> str:
+    """Kolumna „Miejsce” w trybie szybkim: która z kolei jest domena na 1. stronie (wyniki organiczne)."""
+    rank = r.brand
+    if r.indexed is None or rank is None:
+        return "—"
+    if rank.place:
+        return f"{rank.place}."
+    if r.indexed and r.index_source == "site":
+        return "poza 1. str."
+    return "tylko wiadomości" if rank.stories else "—"
 
 
 def market_result(report: DomainReport, plan: Plan) -> Result | None:
@@ -1672,11 +1748,12 @@ def assess_quick(report: DomainReport, plan: Plan, add) -> None:
     first = [r for r in on_page if r.brand.place == 1]
     missing = [r for r in rows if not r.brand.place]
     if not on_page:
-        add(BAD, f"Po wpisaniu „{query}” domeny nie ma na 1. stronie w żadnym ze sprawdzonych krajów ({len(rows)})")
+        add(BAD, f"Niezaindeksowana: po wpisaniu „{query}” domeny nie ma na 1. stronie w żadnym ze sprawdzonych "
+                 f"krajów ({len(rows)})")
     elif len(first) == len(rows):
-        add(OK, f"1. miejsce po wpisaniu „{query}” we wszystkich sprawdzonych krajach ({len(rows)})")
+        add(OK, f"Zaindeksowana: 1. miejsce po wpisaniu „{query}” we wszystkich sprawdzonych krajach ({len(rows)})")
     else:  # nie wszędzie 1. miejsce — tak jak w trybie pełnym to ostrzeżenie
-        add(WARN, f"Na 1. stronie po wpisaniu „{query}” w {len(on_page)}/{len(rows)} krajach, "
+        add(WARN, f"Zaindeksowana (na 1. stronie po wpisaniu „{query}”) w {len(on_page)}/{len(rows)} krajach, "
                   f"1. miejsce tylko w {len(first)}")
         if missing:
             add(WARN, f"Brak na 1. stronie w: {names(missing)}")
@@ -1952,20 +2029,23 @@ def read_history(path: Path) -> list[dict]:
     return records
 
 
-def history_summary(record: dict) -> str:
-    """„indeks 28/30” (tryb pełny) albo „na 1. str. 3/30” (tryb szybki) — z jednego wpisu historii."""
-    countries = [v for v in record["kraje"].values() if isinstance(v, dict)]
-    if record.get("tryb") == "quick":
-        on_page = sum(1 for v in countries if v.get("n"))
-        return f"na 1. str. {on_page}/{len(countries)}"
-    yes = sum(1 for v in countries if v.get("i"))
-    return f"indeks {yes}/{len(countries)}"
-
-
 def place_text(value) -> str:
     if value is None:
         return "—"
     return f"{value}. miejsce" if value else "brak"
+
+
+def history_summary(record: dict) -> str:
+    """Jedna linia z wpisu historii: „zaindeksowana 28/30 · 1. miejsce w 25 · google.pl: 1. miejsce” (tryb szybki)
+    albo „indeks 28/30 · 1. w site: strona główna · na nazwę: 1. miejsce” (tryb pełny)."""
+    stats = NameStats.of_record(record)
+    market = record["kraje"].get(record.get("rynek")) or {}
+    if stats.quick:
+        where = COUNTRY_BY_CODE[stats.market].domain if stats.market in COUNTRY_BY_CODE else stats.market
+        return (f"zaindeksowana {stats.indexed}/{stats.checked} · 1. miejsce w {stats.first}"
+                + (f" · {where}: {place_text(market.get('n'))}" if where and market else ""))
+    return (f"indeks {stats.indexed}/{stats.checked} · 1. w site: {FIRST_KIND_TEXT.get(market.get('g'), '—')} · "
+            f"na nazwę: {place_text(market.get('n'))}")
 
 
 def history_changes(previous: dict, current: dict) -> list[str]:
@@ -2007,11 +2087,43 @@ def show_history(domains: list[str]) -> int:
             print("  brak zapisanych sprawdzeń")
             continue
         for record in records[-20:]:
-            market = record["kraje"].get(record.get("rynek")) or {}
             when = clean(record.get("czas", "?"))[:16].replace("T", " ")
-            print(f"  {when}  {history_summary(record)}  ·  1. w site: "
-                  f"{FIRST_KIND_TEXT.get(market.get('g'), '—')}  ·  na nazwę: {place_text(market.get('n'))}"
-                  f"  ·  {clean(record.get('werdykt', '?'))}")
+            print(f"  {when}  {history_summary(record)}  ·  {clean(record.get('werdykt', '?'))}")
+    return 0
+
+
+def show_stats(domains: list[str]) -> int:
+    """Statystyki z historii: ostatnie sprawdzenie każdej domeny — zaindeksowana, miejsca na samą nazwę, werdykt."""
+    paths = [history_path(d) for d in domains] if domains else sorted(HISTORY_DIR.glob("*.jsonl"))
+    latest = [(path.name.removesuffix(".jsonl"), records[-1]) for path in paths if (records := read_history(path))]
+    if not latest:
+        print("Brak zapisanych sprawdzeń (zapisuje się każde sprawdzenie z zapytaniami do Google).")
+        return 0
+    headers = ["Domena", "Sprawdzono", "Tryb", "Zaindeksowana", "1. miejsce", "Śr. miejsce", "Na nazwę (rynek)",
+               "Werdykt"]
+    rows, colors = [], []
+    for domain, record in latest:
+        stats = NameStats.of_record(record)
+        where = COUNTRY_BY_CODE[stats.market].domain if stats.market in COUNTRY_BY_CODE else stats.market or "?"
+        verdict = clean(record.get("werdykt", "?"))
+        rows.append([domain, clean(record.get("czas", "?"))[:16].replace("T", " "),
+                     "szybki" if stats.quick else "pełny", f"{stats.indexed}/{stats.checked}",
+                     f"{stats.first}/{len(stats.places)}" if stats.places else "—",
+                     f"{stats.average:.1f}" if stats.average else "—",
+                     f"{where}: {place_text(stats.places.get(stats.market))}", verdict])
+        full = stats.checked and stats.indexed == stats.checked
+        colors.append({3: "green" if full else "yellow" if stats.indexed else "red",
+                       7: VERDICTS.get(verdict, ("", "dim"))[1]})
+    all_stats = [NameStats.of_record(record) for _, record in latest]
+    indexed = sum(1 for stats in all_stats if stats.indexed)
+    top = sum(1 for stats in all_stats if stats.places.get(stats.market) == 1)
+    section(f"STATYSTYKI — ostatnie sprawdzenie {len(latest)} {plural(len(latest), 'domeny', 'domen', 'domen')}")
+    print_table(headers, rows, colors, indent="  ")
+    print()
+    say(INFO, f"Zaindeksowane (choć w jednym kraju): {indexed}/{len(latest)} · 1. miejsce na nazwę na głównym "
+              f"rynku: {top}/{len(latest)}")
+    say(INFO, "Zaindeksowana: w trybie szybkim — jest na 1. stronie wyników po wpisaniu samej nazwy; "
+              "w pełnym — jest w wynikach site:")
     return 0
 
 
@@ -2058,32 +2170,58 @@ def fmt_count(r: Result) -> str:
 
 
 def print_index_quick(report: DomainReport, plan: Plan) -> None:
-    results = report.results
-    fallback = any(r.index_source == "site" for r in results)
-    headers = ["Kraj", "Google", f"Na „{brand_name(report.domain)}”"] + (["Indeks (site:)"] if fallback else []) \
-        + ["Adres z listy / błąd"]
+    results, name = report.results, brand_name(report.domain)
+    headers = ["Kraj", "Google", "Zaindeksowana", "Miejsce", "Adres z wyników / błąd"]
     rows, colors = [], []
     for r in results:
-        rank = r.brand
-        row = [f"{r.country.name} ({r.country.code})", r.country.domain,
-               "BŁĄD" if r.indexed is None else rank_text(rank)]
-        color = {2: "green" if rank and rank.place == 1 else "yellow" if rank and rank.place else "red"}
-        if fallback:
-            row.append(index_status(r) if r.index_source == "site" else "—")
-        row.append(r.error or (rank.url if rank and rank.url else ""))
-        if r.error:
-            color[len(row) - 1] = "yellow"
-        rows.append(row)
+        index, place = quick_index_cell(r), quick_place_cell(r)
+        url = r.brand.url if r.brand and r.brand.url else r.first_url if r.indexed else ""
+        rows.append([f"{r.country.name} ({r.country.code})", r.country.domain, index, place,
+                     r.error or url or r.recheck])  # recheck: błąd dodatkowego site:
+        color = {2: "green" if index == "TAK" else "red" if index.startswith("NIE") else "yellow",
+                 3: "green" if place == "1." else "dim" if place == "—" else "yellow"}
+        if r.error or r.recheck:
+            color[4] = "yellow"
         colors.append(color)
     print_table(headers, rows, colors, indent="  ")
-    ranked = [r for r in results if r.brand and r.indexed is not None]
-    on_page = sum(1 for r in ranked if r.brand.place)
     print()
-    say(INFO, f"Tryb szybki: jedno zapytanie „{brand_name(report.domain)}” na kraj, tylko 1. strona wyników — "
-              f"domena jest na niej w {on_page}/{len(ranked)} krajach.")
+    say(INFO, f"Zaindeksowana = {report.domain} jest na 1. stronie wyników po wpisaniu „{name}” (jedno zapytanie "
+              f"na kraj, w języku kraju; NIE = nie ma jej na 1. stronie). Miejsce = która z kolei (wyniki organiczne).")
     failed = [r for r in results if r.indexed is None]
     if failed:
         say(WARN, f"Nie udało się sprawdzić ({len(failed)}): {', '.join(r.country.domain for r in failed)}")
+
+
+def stat_line(label: str, value: str, color: str = "") -> None:
+    """„  Zaindeksowana:      4/5 krajów” — długie listy krajów zawijane pod wartością."""
+    lead = f"  {label:<20}"
+    text = textwrap.fill(value, max(60, min(term_width(), 130)), initial_indent=lead,
+                         subsequent_indent=" " * len(lead))
+    print(paint(text, color) if color else text)
+
+
+def print_name_stats(report: DomainReport, plan: Plan) -> None:
+    """Statystyki trybu szybkiego: w ilu krajach zaindeksowana (jest na 1. stronie) i na których miejscach."""
+    stats = NameStats.of_report(report, plan)
+    total = len(stats.places)
+    if not total:
+        return
+    section(f"STATYSTYKI („{brand_name(report.domain)}”, 1. strona wyników)")
+    stat_line("Zaindeksowana:", f"{stats.indexed}/{total} {plural(total, 'kraj', 'kraje', 'krajów')} "
+                                f"({round(100 * stats.indexed / total)}%)",
+              "green" if stats.indexed == total else "yellow" if stats.indexed else "red")
+    for place, codes in stats.groups():
+        stat_line(f"{place}. miejsce:" if place else "Brak na 1. stronie:", f"{len(codes)} — {', '.join(codes)}")
+    if stats.average:
+        stat_line("Średnie miejsce:", f"{stats.average:.1f}")
+    beyond = [r for r in report.results if r.index_source == "site"]  # site: pytany tylko tam, gdzie brak na 1. str.
+    for label, rows in (("W indeksie (site:):", [r for r in beyond if r.indexed]),
+                        ("Brak w indeksie:", [r for r in beyond if not r.indexed])):
+        if rows:
+            stat_line(label, f"{len(rows)} — {', '.join(r.country.code for r in rows)}")
+    market = stats.places.get(plan.market.code)
+    if market is not None:
+        stat_line("Główny rynek:", f"{plan.market.domain} — {place_text(market)}")
 
 
 def print_index(report: DomainReport, plan: Plan) -> None:
@@ -2285,8 +2423,10 @@ def print_report(report: DomainReport, plan: Plan, provider_name: str) -> None:
     print()
     print(paint(f"━━ {report.domain} {line}", "bold"))
     if report.results and plan.mode == "quick":
-        section(f"POZYCJA NA „{brand_name(report.domain)}” ({provider_name}, tryb szybki: tylko 1. strona wyników)")
+        section(f"INDEKS GOOGLE NA „{brand_name(report.domain)}” ({provider_name}, 1. strona wyników w każdym kraju, "
+                f"główny rynek: {plan.market.domain})")
         print_index(report, plan)
+        print_name_stats(report, plan)
     elif report.results:
         section(f"INDEKS GOOGLE ({provider_name}, site:{report.domain}, główny rynek: {plan.market.domain})")
         print_index(report, plan)
@@ -2326,17 +2466,17 @@ def site_summary(site) -> str:
 def print_comparison(reports: list[DomainReport], plan: Plan) -> None:
     section("PORÓWNANIE DOMEN")
     quick = plan.mode == "quick"
-    headers = ["Domena", "Na 1. stronie" if quick else "Indeks", "1. w site:", "Na nazwę", "Strona", "Wiek",
-               "Archiwum", "Werdykt"]
+    headers = ["Domena", "Zaindeksowana" if quick else "Indeks", "1. miejsce" if quick else "1. w site:", "Na nazwę",
+               "Strona", "Wiek", "Archiwum", "Werdykt"]
     rows, colors = [], []
     for report in reports:
-        checked = [r for r in report.results if r.indexed is not None]
-        if quick:
-            index = f"{sum(1 for r in checked if r.brand and r.brand.place)}/{len(checked)}" if checked else "—"
-        else:
-            index = f"{sum(1 for r in checked if r.indexed)}/{len(checked)}" if checked else "—"
+        stats = NameStats.of_report(report, plan)
+        index = f"{stats.indexed}/{stats.checked}" if stats.checked else "—"
         m = market_result(report, plan)
-        kind = FIRST_KIND_TEXT.get(m.first_kind, "—") if m and m.first_kind else "—"
+        if quick:
+            kind = f"{stats.first}/{len(stats.places)}" if stats.places else "—"
+        else:
+            kind = FIRST_KIND_TEXT.get(m.first_kind, "—") if m and m.first_kind else "—"
         brand = rank_text(m.brand) if m and m.brand else "—"
         reg = report.reg
         age = "—"
@@ -2361,7 +2501,7 @@ def write_csv(path: str, reports: list[DomainReport], plan: Plan) -> str:
     """Zapisuje wyniki per kraj do `path` i podsumowanie domen do `<nazwa>_podsumowanie.csv`."""
     columns = [
         "domena", "kraj", "gl", "google", "w_indeksie", "szacunek_google", "wyniki_domeny_na_1_str",
-        "pierwszy_wynik_site", "pierwszy_wynik_typ", "pozycja_na_nazwe", "pozycja_na_nazwe_strona",
+        "pierwszy_wynik_site", "pierwszy_wynik_typ", "na_1_stronie", "pozycja_na_nazwe", "pozycja_na_nazwe_strona",
         "pozycja_na_nazwe_url", "fraza", "fraza_pozycja", "fraza_strona", "fraza_url",
         "usuniete_wyniki", "powtorka", "blad", "tryb",
     ]
@@ -2371,10 +2511,12 @@ def write_csv(path: str, reports: list[DomainReport], plan: Plan) -> str:
         for report in reports:
             for r in report.results:
                 brand, phrase = r.brand or Rank(""), r.phrase or Rank("")
+                # na_1_stronie: czy po wpisaniu samej nazwy domena jest na 1. stronie (w trybie szybkim = zaindeksowana)
+                on_page = yes_no(brand.page == 1) if r.brand and not brand.error and r.indexed is not None else ""
                 writer.writerow(csv_cell(v) for v in (
                     r.domain, r.country.name, r.country.code, r.country.domain,
                     index_status(r).rstrip("*"), r.total, len(r.hits),
-                    r.first_url, FIRST_KIND_TEXT.get(r.first_kind, ""), brand.place, brand.page, brand.url,
+                    r.first_url, FIRST_KIND_TEXT.get(r.first_kind, ""), on_page, brand.place, brand.page, brand.url,
                     phrase.query, phrase.place, phrase.page, phrase.url, " | ".join(r.notices),
                     {"found": "TAK dopiero w powtórce", "confirmed": "NIE potwierdzone"}.get(r.recheck, r.recheck),
                     r.error or brand.error or phrase.error, "szybki" if plan.mode == "quick" else "pełny",
@@ -2382,7 +2524,8 @@ def write_csv(path: str, reports: list[DomainReport], plan: Plan) -> str:
     summary_path = str(Path(path).with_name(Path(path).stem + "_podsumowanie.csv"))
     columns = [
         "domena", "werdykt", "w_indeksie_krajow", "sprawdzonych_krajow", "pierwszy_wynik_site_rynek",
-        "pozycja_na_nazwe_rynek", "status_http", "strona_koncowa", "https", "robots_txt", "noindex",
+        "pozycja_na_nazwe_rynek", "na_1_stronie_krajow", "pierwsze_miejsce_krajow", "srednie_miejsce",
+        "status_http", "strona_koncowa", "https", "robots_txt", "noindex",
         "typ_strony", "tytul", "zarejestrowana", "wygasa", "rejestrator", "status_rejestru", "serwery_dns",
         "wolna", "archiwum_lata", "problemy_i_uwagi",
     ]
@@ -2392,6 +2535,7 @@ def write_csv(path: str, reports: list[DomainReport], plan: Plan) -> str:
         for report in reports:
             checked = [r for r in report.results if r.indexed is not None]
             m = market_result(report, plan)
+            stats = NameStats.of_report(report, plan)
             site = report.site if isinstance(report.site, SiteInfo) else None
             reg = report.reg if isinstance(report.reg, RegInfo) else None
             archive = report.archive if isinstance(report.archive, ArchiveInfo) else None
@@ -2399,6 +2543,10 @@ def write_csv(path: str, reports: list[DomainReport], plan: Plan) -> str:
             writer.writerow(csv_cell(v) for v in (
                 report.domain, report.verdict, sum(1 for r in checked if r.indexed), len(checked),
                 FIRST_KIND_TEXT.get(m.first_kind, "") if m else "", rank_text(m.brand) if m else "",
+                sum(1 for r in checked if r.brand and r.brand.page == 1) if stats.places else "",
+                stats.first if stats.places else "",
+                # przecinek dziesiętny — polski Excel wziąłby „1.5” za datę
+                f"{stats.average:.1f}".replace(".", ",") if stats.average else "",
                 site.status if site else "", site.final_url if site else "",
                 yes_no(site.https_ok) if site else "", site.robots_note if site else "",
                 site.noindex if site else "", page.kind if page else "", page.title if page else "",
@@ -2635,21 +2783,22 @@ def print_countries() -> None:
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="check_index.py",
-        description="Sprawdza domenę: indeks Google w wielu krajach, pozycję na własną nazwę "
-                    "i gotowość strony do publikacji.",
+        description="Sprawdza domenę: czy jest zaindeksowana w wielu krajach (sama nazwa, np. „savowin”, "
+                    "na 1. stronie Google), na którym miejscu i czy strona jest gotowa do publikacji.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             przykłady:
-              python3 check_index.py test.pl                     pełny raport (30 krajów)
-              python3 check_index.py savowin --kraje pl          sama nazwa = savowin.com; pozycja dla „savowin”
-              python3 check_index.py savowin --szybko            tylko „savowin” na 1. stronie: 1 zapytanie na kraj
-              python3 check_index.py test.pl --kraje pl,de,uk    tylko wybrane kraje
+              python3 check_index.py savowin                     = savowin.com; w 30 krajach „savowin” na 1. stronie:
+                                                                 zaindeksowana i na którym miejscu (1 zapytanie na kraj)
+              python3 check_index.py savowin --kraje pl,de,uk    tylko wybrane kraje
+              python3 check_index.py savowin --pelny             tryb pełny: site:savowin.com + pozycja na nazwę
               python3 check_index.py -f domeny.txt --bez-api     darmowa selekcja wielu domen
-              python3 check_index.py test.pl --pozycja           pozycja na nazwę we wszystkich krajach
+              python3 check_index.py test.pl --pozycja           tryb pełny, pozycja na nazwę we wszystkich krajach
               python3 check_index.py test.pl --fraza "tanie buty" --kraje pl
               python3 check_index.py test.pl --csv wyniki.csv    wyniki do Excela
+              python3 check_index.py --statystyki                zaindeksowane domeny i miejsca (z historii)
               python3 check_index.py --historia test.pl          poprzednie sprawdzenia
-              python3 check_index.py test.pl --potwierdz         powtórz każde „NIE” (nowe, chwiejne domeny)
+              python3 check_index.py test.pl --potwierdz         tryb pełny, powtórz każde „NIE” (nowe domeny)
               python3 check_index.py --konto                     ile zostało zapytań na każdym kluczu
         """),
     )
@@ -2668,23 +2817,28 @@ def parse_args(argv=None) -> argparse.Namespace:
     scope.add_argument("-a", "--wszystkie", action="store_true",
                        help=f"wszystkie {len(ALL_COUNTRIES)} krajów zamiast {len(MAIN_COUNTRIES)} głównych")
     google.add_argument("-r", "--rynek", metavar="KOD",
-                        help="główny rynek: tu sprawdzana jest pozycja na własną nazwę "
+                        help="główny rynek: w trybie pełnym tu sprawdzana jest pozycja na własną nazwę "
                              "(domyślnie pierwszy kraj z listy, czyli pl)")
+    mode = google.add_mutually_exclusive_group()
+    mode.add_argument("--szybko", action="store_true",
+                      help="tryb szybki (domyślny): w każdym kraju jedno zapytanie o samą nazwę bez końcówki "
+                           "(np. „savowin”) i tylko 1. strona wyników — jeśli domena tam jest, jest zaindeksowana, "
+                           "i wiadomo, na którym miejscu")
+    mode.add_argument("--pelny", action="store_true",
+                      help="tryb pełny: site:domena w każdym kraju (indeks, 1. wynik site:) + pozycja na samą nazwę "
+                           "na głównym rynku (do --max-stron stron)")
     brand = google.add_mutually_exclusive_group()
     brand.add_argument("--pozycja", action="store_true",
-                       help="pozycja na własną nazwę (sama nazwa bez końcówki, np. „savowin”) we WSZYSTKICH "
-                            "krajach (domyślnie tylko na głównym rynku)")
+                       help="tryb pełny z pozycją na własną nazwę (sama nazwa bez końcówki, np. „savowin”) "
+                            "we WSZYSTKICH krajach (domyślnie tylko na głównym rynku)")
     brand.add_argument("--bez-pozycji", action="store_true",
-                       help="nie sprawdzaj pozycji na własną nazwę (oszczędza zapytania)")
+                       help="tryb pełny bez pozycji na własną nazwę (tylko site:, oszczędza zapytania)")
     google.add_argument("--fraza", metavar="TEKST", help="sprawdź też pozycję dla tej frazy (w każdym kraju)")
-    google.add_argument("--szybko", action="store_true",
-                        help="tryb szybki: w każdym kraju tylko jedno zapytanie o samą nazwę (np. „savowin”) i tylko "
-                             "1. strona wyników — bez site:")
     google.add_argument("--sprawdz-indeks", action="store_true",
                         help="w trybie szybkim: gdy domeny nie ma na 1. stronie, sprawdź site: (1 zapytanie więcej)")
     google.add_argument("--potwierdz", action="store_true",
-                        help="powtórz sprawdzenie w KAŻDYM kraju z wynikiem NIE (domyślnie tylko na głównym rynku); "
-                             "przydatne przy nowych domenach, kosztuje do 2 zapytań na kraj")
+                        help="tryb pełny: powtórz sprawdzenie w KAŻDYM kraju z wynikiem NIE (domyślnie tylko na "
+                             "głównym rynku); przydatne przy nowych domenach, kosztuje do 2 zapytań na kraj")
     google.add_argument("--max-stron", type=int, default=3, choices=range(1, 11), metavar="N",
                         help="ile stron wyników przeszukać przy pozycjach (1-10, domyślnie 3)")
     google.add_argument("--bez-api", action="store_true",
@@ -2701,6 +2855,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     output.add_argument("--bez-zapisu", action="store_true", help="nie zapisuj wyniku w historii")
     output.add_argument("--historia", action="store_true",
                         help="pokaż historię sprawdzeń podanych domen (albo wszystkich) i zakończ")
+    output.add_argument("--statystyki", action="store_true",
+                        help="pokaż statystyki z historii: ostatnie sprawdzenie każdej domeny (w ilu krajach "
+                             "zaindeksowana, na których miejscach, werdykt) i zakończ")
     output.add_argument("--konto", action="store_true", help="pokaż stan konta API i zakończ")
 
     other = parser.add_argument_group("Inne")
@@ -2811,6 +2968,8 @@ def main(argv=None) -> int:
         load_dotenv(env_path)
     if args.historia:
         return show_history(collect_domains(args, prompt=False))
+    if args.statystyki:
+        return show_stats(collect_domains(args, prompt=False))
 
     use_api = not args.bez_api
     provider = make_provider(args.provider) if use_api or args.konto else None
@@ -2829,10 +2988,12 @@ def main(argv=None) -> int:
     if not domains:
         print("Nie podano żadnej poprawnej domeny.", file=sys.stderr)
         return 2
-    mode = "all" if args.pozycja else "off" if args.bez_pozycji else "market"
-    plan = Plan(countries, market, brand_codes_for(mode, countries, market), args.fraza if use_api else None,
+    brand = "all" if args.pozycja else "off" if args.bez_pozycji else "market"
+    # Domyślnie tryb szybki; opcje, które działają tylko w pełnym (site:), same go włączają.
+    full = args.pelny or (not args.szybko and (args.pozycja or args.bez_pozycji or args.potwierdz))
+    plan = Plan(countries, market, brand_codes_for(brand, countries, market), args.fraza if use_api else None,
                 args.max_stron, use_api, not args.bez_strony, not args.bez_whois, not args.bez_archiwum,
-                args.potwierdz, "quick" if args.szybko else "full", args.sprawdz_indeks)
+                args.potwierdz, "full" if full else "quick", args.sprawdz_indeks)
     if not (plan.use_api or plan.site or plan.reg or plan.archive):
         print("Wszystkie testy są wyłączone — nie ma czego sprawdzać.", file=sys.stderr)
         return 2
@@ -2854,7 +3015,7 @@ def main(argv=None) -> int:
         available = provider.pool.available()
         keys = len(provider.pool.keys)
         header.append(f"Google: {provider.name}, {len(countries)} {plural(len(countries), 'kraj', 'kraje', 'krajów')}, "
-                      + ("tryb szybki (1. strona), " if plan.mode == "quick" else "")
+                      + ("tryb szybki (sama nazwa, 1. strona), " if plan.mode == "quick" else "tryb pełny (site:), ")
                       + f"rynek {market.domain}, zapytań {site_queries}–{worst}"
                       + (f", kluczy {keys}" if keys > 1 else "")
                       + (f", dostępnych zapytań {available}" if available is not None else ""))
